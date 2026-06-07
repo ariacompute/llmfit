@@ -1721,7 +1721,9 @@ impl Default for LmStudioProvider {
                 normalized
             })
             .unwrap_or_else(|| "http://127.0.0.1:1234".to_string());
-        let api_key = std::env::var("LMSTUDIO_API_KEY").ok();
+        let api_key = std::env::var("LMSTUDIO_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
         Self { base_url, api_key }
     }
 }
@@ -3448,6 +3450,34 @@ mod tests {
         assert!(candidates.contains(&"qwen3".to_string()));
         // No slash, so repo == full name — no duplicate
         assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_lmstudio_provider_default_reads_api_key() {
+        use std::env;
+
+        // Save and restore the original value (or absence) of LMSTUDIO_API_KEY.
+        let had_key = env::var("LMSTUDIO_API_KEY").ok();
+        env::remove_var("LMSTUDIO_API_KEY");
+
+        let provider = LmStudioProvider::default();
+        assert!(provider.api_key.is_none());
+
+        // Set to a real value — should be picked up.
+        env::set_var("LMSTUDIO_API_KEY", "my-secret-key");
+        let provider2 = LmStudioProvider::default();
+        assert_eq!(provider2.api_key, Some("my-secret-key".to_string()));
+
+        // Set to empty string — must NOT produce `Some("")`.
+        env::set_var("LMSTUDIO_API_KEY", "");
+        let provider3 = LmStudioProvider::default();
+        assert!(provider3.api_key.is_none());
+
+        // Restore original state.
+        match had_key {
+            Some(val) => env::set_var("LMSTUDIO_API_KEY", val),
+            None => env::remove_var("LMSTUDIO_API_KEY"),
+        }
     }
 
     #[test]
