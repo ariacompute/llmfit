@@ -140,9 +140,7 @@ impl SystemSpecs {
         // AMD GPUs via rocm-smi or sysfs
         let amd_rocm = Self::detect_amd_gpu_rocm_info();
         if amd_rocm.is_empty() {
-            if let Some(amd) = Self::detect_amd_gpu_sysfs_info() {
-                gpus.push(amd);
-            }
+            gpus.extend(Self::detect_amd_gpu_sysfs_info());
         } else {
             gpus.extend(amd_rocm);
         }
@@ -664,19 +662,28 @@ impl SystemSpecs {
             .collect()
     }
 
-    /// Detect AMD GPU via sysfs on Linux (works without ROCm installed).
-    /// AMD vendor ID is 0x1002.
-    fn detect_amd_gpu_sysfs_info() -> Option<GpuInfo> {
+    /// Detect AMD GPUs via sysfs on Linux (works without ROCm installed).
+    /// AMD vendor ID is 0x1002. Returns one GpuInfo per distinct model,
+    /// with count and per-card VRAM for same-model multi-GPU setups.
+    fn detect_amd_gpu_sysfs_info() -> Vec<GpuInfo> {
         if !cfg!(target_os = "linux") {
-            return None;
+            return Vec::new();
         }
 
-        let mut slot_hints: Vec<String> = Vec::new();
-        let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+        let entries = match std::fs::read_dir("/sys/class/drm") {
+            Ok(e) => e,
+            Err(_) => return Vec::new(),
+        };
+
+        // Collect per-card (name, vram) pairs.
+        let mut cards: Vec<(String, Option<f64>)> = Vec::new();
 
         for entry in entries.flatten() {
             let card_path = entry.path();
-            let fname = card_path.file_name()?.to_str()?.to_string();
+            let fname = match card_path.file_name().and_then(|f| f.to_str()) {
+                Some(f) => f.to_string(),
+                None => continue,
+            };
             // Only look at cardN entries, not cardN-DP-1 etc.
             if !fname.starts_with("card") || fname.contains('-') {
                 continue;
@@ -702,6 +709,7 @@ impl SystemSpecs {
                 vram_gb = Some(vram_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
             }
 
+            let mut slot_hints: Vec<String> = Vec::new();
             if let Ok(uevent) = std::fs::read_to_string(device_path.join("uevent")) {
                 for line in uevent.lines() {
                     if let Some(slot) = line.strip_prefix("PCI_SLOT_NAME=") {
@@ -722,16 +730,41 @@ impl SystemSpecs {
                 }
             }
 
-            // AMD GPU without ROCm — Vulkan is the most likely inference backend
-            return Some(GpuInfo {
+            cards.push((name, vram_gb));
+        }
+
+        // Group identical models, tracking count and max per-card VRAM.
+        let mut grouped: BTreeMap<String, (u32, Option<f64>)> = BTreeMap::new();
+        for (name, vram_gb) in cards {
+            let entry = grouped.entry(name).or_insert((0, None));
+            entry.0 += 1;
+            match (entry.1, vram_gb) {
+                (Some(existing), Some(new)) if new > existing => entry.1 = Some(new),
+                (None, Some(_)) => entry.1 = vram_gb,
+                _ => {}
+            }
+        }
+
+        // Filter out integrated GPUs when discrete GPUs are present.
+        let has_discrete = grouped.iter().any(|(name, (_, vram))| {
+            !Self::is_integrated_gpu_name(name) && vram.unwrap_or(0.0) > 2.0
+        });
+        if has_discrete {
+            grouped.retain(|name, (_, vram)| {
+                !Self::is_integrated_gpu_name(name) && vram.unwrap_or(0.0) > 2.0
+            });
+        }
+
+        grouped
+            .into_iter()
+            .map(|(name, (count, vram_gb))| GpuInfo {
                 name,
                 vram_gb,
                 backend: GpuBackend::Vulkan,
-                count: 1,
+                count,
                 unified_memory: false,
-            });
-        }
-        None
+            })
+            .collect()
     }
 
     /// Extract AMD GPU name from lspci output.
