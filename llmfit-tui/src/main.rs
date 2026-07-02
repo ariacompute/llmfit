@@ -204,6 +204,51 @@ AGENT USAGE:
   gpu_backend, unified_memory, os } }")]
     System,
 
+    /// Generate a Kubernetes DRA ResourceClaim encoding the model's fit
+    #[command(long_about = "\
+Generate a Kubernetes DRA ResourceClaim (or ResourceClaimTemplate) whose CEL
+selector encodes the model's fit inequality against attributes published by
+the llmfit.ai DRA driver (llmfit-dra). Constants (weights size, memory floor,
+bandwidth floor) are resolved from the model database and inlined; the YAML
+is printed on stdout with provenance comments.
+
+PRECONDITIONS:
+  None locally. Applying the output requires a cluster running llmfit-dra
+  (Kubernetes >= 1.34) with its shipped DeviceClasses.
+
+SIDE EFFECTS:
+  None — prints YAML; pipe to kubectl to apply.
+
+EXIT CODES:
+  0  Success
+  1  Unknown/ambiguous model, or invalid bounds
+
+AGENT USAGE:
+  llmfit claim qwen2.5-32b --min-tps 20 | kubectl apply -f -
+  llmfit claim mistral-7b --template > claim-template.yaml")]
+    Claim {
+        /// Model name (exact or unambiguous partial match)
+        model: String,
+        /// Minimum acceptable decode speed, tokens/second
+        #[arg(long, default_value_t = 20.0)]
+        min_tps: f64,
+        /// Override the database entry's quantization (e.g. Q4_K_M, Q8_0)
+        #[arg(long)]
+        quant: Option<String>,
+        /// Backend efficiency percentage used in the fit inequality
+        #[arg(long, default_value_t = 55)]
+        efficiency: u32,
+        /// DeviceClass the claim requests against
+        #[arg(long, default_value = "llmfit.ai")]
+        device_class: String,
+        /// Emit a ResourceClaimTemplate (for pod templates) instead of a ResourceClaim
+        #[arg(long)]
+        template: bool,
+        /// metadata.name for the generated object (default: derived from the model name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+
     /// List all available LLM models
     #[command(long_about = "\
 List all available LLM models.
@@ -2505,6 +2550,35 @@ fn main() {
                     display::display_json_system(&specs);
                 } else {
                     specs.display();
+                }
+            }
+
+            Commands::Claim {
+                model,
+                min_tps,
+                quant,
+                efficiency,
+                device_class,
+                template,
+                name,
+            } => {
+                let db = ModelDatabase::new();
+                let target = llmfit_core::claim::ClaimTarget {
+                    min_tps,
+                    efficiency_pct: efficiency,
+                    device_class,
+                    template,
+                    quant,
+                    name,
+                };
+                match resolve_model_selector(db.get_all_models(), &model)
+                    .and_then(|m| llmfit_core::claim::render(m, &target))
+                {
+                    Ok(yaml) => print!("{}", yaml),
+                    Err(err) => {
+                        eprintln!("Error: {}", err);
+                        std::process::exit(1);
+                    }
                 }
             }
 

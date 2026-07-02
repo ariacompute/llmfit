@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod bench;
 pub mod benchmarks;
+pub mod claim;
 pub mod fit;
 pub mod hardware;
 pub mod models;
