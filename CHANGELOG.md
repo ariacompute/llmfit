@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.35](https://github.com/AlexsJones/llmfit/compare/v0.9.34...v0.9.35) (2026-07-02)
+
+
+### Features
+
+* add claim subcommand generating Kubernetes DRA ResourceClaims ([08547ef](https://github.com/AlexsJones/llmfit/commit/08547efa277dd3f733ecdf72312a3376fbc2a01b))
+* add claim subcommand generating Kubernetes DRA ResourceClaims ([3369a49](https://github.com/AlexsJones/llmfit/commit/3369a492630f357c65e2344de18b5a2e35ed4950))
+* expose GPU memory bandwidth in system JSON and add Strix Halo entries ([3bfd334](https://github.com/AlexsJones/llmfit/commit/3bfd33406b071f48fddc7fb6e99fe62e55096511))
+
+
+### Bug Fixes
+
+* reset list cursor to top when the search query changes ([5e4dc7b](https://github.com/AlexsJones/llmfit/commit/5e4dc7b1e578c5a2366a8f7b94220d68178e2fae))
+* reset list cursor to top when the search query changes ([43884f5](https://github.com/AlexsJones/llmfit/commit/43884f500a9b392b03bc2d2bc539ba6430d954fd)), closes [#657](https://github.com/AlexsJones/llmfit/issues/657)
+
 ## [0.9.34](https://github.com/AlexsJones/llmfit/compare/v0.9.33...v0.9.34) (2026-06-28)
 
 
