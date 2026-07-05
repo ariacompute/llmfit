@@ -327,6 +327,7 @@ impl ModelFit {
                 installed: false,
                 fits_with_turboquant: false,
                 effective_context_length: estimation_ctx,
+                usable_context: 0,
             };
         }
 
