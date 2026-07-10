@@ -1,5 +1,11 @@
 //! Contribute benchmark results back to the project as a GitHub pull request.
 //!
+//! Every successful bench run is first recorded in a **local store** as a
+//! ready-to-upload submission payload (see [`store_local`]). Sharing — now or
+//! any time later — uploads everything still pending in a single PR, after
+//! which the files move to `shared/` so they remain as local history but are
+//! never sent twice. Declining to share therefore never discards data.
+//!
 //! No `gh` CLI and no server are required. Authentication uses the GitHub OAuth
 //! **device flow** — the same mechanism `gh auth login` uses — with a public
 //! client id, so nothing secret ships in the binary. The fork / commit / open-PR
@@ -7,7 +13,8 @@
 //!
 //! A `GITHUB_TOKEN` / `GH_TOKEN` env var, or a token cached from a previous
 //! device-flow login, short-circuits the interactive step — which also makes
-//! `--share` usable from CI.
+//! `--share` usable from CI. Credentials are resolved and verified *before*
+//! benchmarks run ([`preflight_auth`]) so a bad token is caught up front.
 //!
 //! All human-facing output goes to stderr so it never corrupts `bench --json`
 //! output on stdout.
@@ -18,6 +25,7 @@ use base64::Engine;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const UPSTREAM_OWNER: &str = "AlexsJones";
@@ -185,12 +193,14 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Slug identifying the hardware, used for the branch name and submission path.
-fn hardware_slug(specs: &SystemSpecs) -> String {
-    let raw = specs
-        .gpu_name
-        .clone()
-        .unwrap_or_else(|| format!("cpu-{}", specs.cpu_name));
+/// Slug identifying the hardware of a stored submission payload, used for the
+/// branch name and submission path.
+fn payload_slug(payload: &Value) -> String {
+    let hw = &payload["hardware"];
+    let raw = hw["hardwareName"]
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("cpu-{}", hw["cpu"].as_str().unwrap_or("unknown")));
     let mut slug: String = raw
         .to_lowercase()
         .chars()
@@ -223,88 +233,369 @@ fn short_hash(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Orchestration
+// Local benchmark store
 // ---------------------------------------------------------------------------
 
-/// Build the submission, confirm with the user, then fork the repo, commit the
-/// result file to a new branch, and open a pull request.
-///
-/// Returns `Ok(Some(pr_url))` on success, `Ok(None)` if the user cancelled or
-/// `--dry-run` was set, and `Err(_)` on failure.
-pub fn share_results(
-    results: &[BenchResult],
-    specs: &SystemSpecs,
-    opts: &ShareOptions,
-) -> Result<Option<String>, String> {
-    if results.is_empty() {
-        return Err("no benchmark results to share".to_string());
+/// A submission payload recorded in the local benchmark store.
+pub struct StoredBenchmark {
+    pub path: PathBuf,
+    pub payload: Value,
+}
+
+impl StoredBenchmark {
+    /// Whether this run was recorded on hardware matching `specs` (same CPU
+    /// and GPU). Measurements from a previous machine configuration must not
+    /// override or calibrate estimates for the current one.
+    pub fn matches_hardware(&self, specs: &SystemSpecs) -> bool {
+        let hw = &self.payload["hardware"];
+        let cpu_ok = hw["cpu"]
+            .as_str()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&specs.cpu_name));
+        let gpu_ok = match (&specs.gpu_name, hw["hardwareName"].as_str()) {
+            (Some(now), Some(then)) => now.eq_ignore_ascii_case(then),
+            (None, None) => true,
+            _ => false,
+        };
+        cpu_ok && gpu_ok
     }
 
+    /// One line per benchmark result: `model via provider — N tok/s`.
+    pub fn result_lines(&self) -> Vec<String> {
+        let Some(results) = self.payload["results"].as_array() else {
+            return Vec::new();
+        };
+        results
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} via {} — {:.1} tok/s",
+                    r["model"].as_str().unwrap_or("?"),
+                    r["provider"].as_str().unwrap_or("?"),
+                    r["avgTps"].as_f64().unwrap_or(0.0),
+                )
+            })
+            .collect()
+    }
+}
+
+/// Root of the local store. Overridable with `LLMFIT_BENCH_STORE` (useful for
+/// tests and for keeping the store on a shared volume).
+fn store_root() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("LLMFIT_BENCH_STORE")
+        && !dir.trim().is_empty()
+    {
+        return Some(PathBuf::from(dir));
+    }
+    Some(dirs::data_local_dir()?.join("llmfit").join("benchmarks"))
+}
+
+fn read_store(subdir: &str) -> Vec<StoredBenchmark> {
+    let Some(dir) = store_root().map(|r| r.join(subdir)) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<StoredBenchmark> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                return None;
+            }
+            let payload: Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+            Some(StoredBenchmark { path, payload })
+        })
+        .collect();
+    // Filenames start with the unix timestamp, so path order is record order.
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    out
+}
+
+/// Record benchmark results locally as a ready-to-upload submission payload.
+/// Returns the path of the stored file.
+pub fn store_local(results: &[BenchResult], specs: &SystemSpecs) -> Result<PathBuf, String> {
+    if results.is_empty() {
+        return Err("no benchmark results to store".to_string());
+    }
     let submission = build_submission(results, specs);
     let json =
         serde_json::to_string_pretty(&submission).map_err(|e| format!("serialize failed: {e}"))?;
+    let dir = store_root()
+        .ok_or("no local data directory")?
+        .join("pending");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{}-{}.json", now_unix(), short_hash(&json)));
+    std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path)
+}
 
-    eprintln!("\n  The following benchmark data would be contributed:\n");
-    for line in json.lines() {
-        eprintln!("    {line}");
+/// Stored benchmarks not yet contributed upstream, oldest first.
+pub fn pending_benchmarks() -> Vec<StoredBenchmark> {
+    read_store("pending")
+}
+
+/// Stored benchmarks already contributed upstream, oldest first.
+pub fn shared_benchmarks() -> Vec<StoredBenchmark> {
+    read_store("shared")
+}
+
+/// Move uploaded submissions from `pending/` to `shared/` so they remain as
+/// local history but are never uploaded twice. Best-effort: a file that cannot
+/// be moved stays pending (worst case a duplicate submission, never data loss).
+pub fn mark_shared(stored: &[StoredBenchmark]) {
+    let Some(dir) = store_root().map(|r| r.join("shared")) else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    for s in stored {
+        if let Some(name) = s.path.file_name() {
+            let _ = std::fs::rename(&s.path, dir.join(name));
+        }
+    }
+}
+
+/// Index of the user's own benchmark runs (pending and shared), used to
+/// annotate fit rows: a throughput measured on THIS machine is ground truth
+/// and takes priority over community medians and formula estimates.
+pub struct LocalBenchIndex {
+    /// (provider model tag, tok/s), newest run first.
+    entries: Vec<(String, f64)>,
+}
+
+impl LocalBenchIndex {
+    /// Load every stored benchmark result recorded on hardware matching
+    /// `specs`. Returns `None` when nothing qualifies so callers can skip
+    /// per-model lookups entirely.
+    pub fn load(specs: &SystemSpecs) -> Option<Self> {
+        let mut entries: Vec<(String, f64)> = Vec::new();
+        for s in shared_benchmarks().into_iter().chain(pending_benchmarks()) {
+            if !s.matches_hardware(specs) {
+                continue;
+            }
+            let Some(results) = s.payload["results"].as_array() else {
+                continue;
+            };
+            for r in results {
+                if let (Some(model), Some(tps)) = (r["model"].as_str(), r["avgTps"].as_f64())
+                    && tps > 0.0
+                {
+                    entries.push((model.to_string(), tps));
+                }
+            }
+        }
+        // Store reads are oldest-first; prefer the newest measurement.
+        entries.reverse();
+        (!entries.is_empty()).then_some(Self { entries })
+    }
+
+    /// Most recent locally measured tok/s for a catalog model, if any stored
+    /// run's provider tag matches it.
+    pub fn lookup(&self, model_hf_name: &str) -> Option<crate::benchmarks::MeasuredTps> {
+        let matches: Vec<f64> = self
+            .entries
+            .iter()
+            .filter(|(tag, _)| crate::providers::tag_matches_model(tag, model_hf_name))
+            .map(|(_, tps)| *tps)
+            .collect();
+        Some(crate::benchmarks::MeasuredTps {
+            tok_s: *matches.first()?,
+            sample_count: matches.len() as u32,
+            hardware_label: "this machine".to_string(),
+            source: crate::benchmarks::MeasuredSource::LocalBench,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------------
+
+/// Share everything in the local pending store as a single pull request.
+/// Interactive CLI flow: lists the stored submissions, confirms with the
+/// user, then uploads and marks them shared. Pass a pre-validated `token`
+/// (from [`preflight_auth`]) to skip credential resolution here.
+///
+/// Returns `Ok(Some(outcome))` on success, `Ok(None)` if the user cancelled
+/// or `--dry-run` was set, and `Err(_)` on failure.
+pub fn share_all_pending(
+    opts: &ShareOptions,
+    token: Option<String>,
+) -> Result<Option<SubmitOutcome>, String> {
+    let stored = pending_benchmarks();
+    if stored.is_empty() {
+        return Err(
+            "no local benchmarks are stored yet. Run `llmfit bench <model>` or \
+             `llmfit bench --all` first."
+                .to_string(),
+        );
+    }
+
+    eprintln!("\n  The following stored benchmark data would be contributed:\n");
+    for s in &stored {
+        for line in s.result_lines() {
+            eprintln!("    - {line}");
+        }
     }
 
     if opts.dry_run {
+        for s in &stored {
+            if let Ok(json) = serde_json::to_string_pretty(&s.payload) {
+                eprintln!("\n  --- {} ---", s.path.display());
+                for line in json.lines() {
+                    eprintln!("    {line}");
+                }
+            }
+        }
         eprintln!("\n  --dry-run: nothing was submitted.");
         return Ok(None);
     }
 
     if !opts.assume_yes {
         let prompt = format!(
-            "\n  Contribute {} result(s) as a PR to {UPSTREAM_OWNER}/{UPSTREAM_REPO}?",
-            results.len()
+            "\n  Share all {} local benchmark submission(s) as a PR to \
+             {UPSTREAM_OWNER}/{UPSTREAM_REPO}?",
+            stored.len()
         );
         if !confirm(&prompt)? {
-            eprintln!("  Cancelled.");
+            eprintln!("  Cancelled — results remain stored locally.");
             return Ok(None);
         }
     }
 
-    let token = resolve_token()?;
-    let pr_url = submit_results(results, specs, &token)?;
-    Ok(Some(pr_url))
+    let token = match token {
+        Some(t) => t,
+        None => preflight_auth()?,
+    };
+    let outcome = submit_stored(&stored, &token)?;
+    mark_shared(&stored);
+    Ok(Some(outcome))
 }
 
-/// Non-interactive core of the share flow: fork the repo, commit the result
-/// file to a new branch, and open a pull request using an already-resolved
-/// token. Never prompts or reads stdin, so it is safe to call from a worker
-/// thread while a TUI owns the terminal. Returns the PR URL.
-pub fn submit_results(
-    results: &[BenchResult],
-    specs: &SystemSpecs,
-    token: &str,
-) -> Result<String, String> {
-    if results.is_empty() {
+/// Outcome of uploading stored submissions.
+pub struct SubmitOutcome {
+    /// PR that now contains the results — an already-open bench PR when one
+    /// existed, otherwise a newly opened one. `None` when every file had
+    /// already been submitted upstream and there was nothing to open a PR for.
+    pub pr_url: Option<String>,
+    /// Results were appended to an existing open PR instead of a new one.
+    pub reused_existing_pr: bool,
+    /// Files actually uploaded this time.
+    pub uploaded: usize,
+    /// Files skipped because a submission with the same name already exists
+    /// upstream (e.g. a retry after a partially failed share).
+    pub skipped: usize,
+}
+
+/// Non-interactive core of the share flow, safe to call from a worker thread
+/// while a TUI owns the terminal (never prompts or reads stdin). Forks the
+/// repo, then either **appends** the stored submissions to the user's
+/// already-open benchmark PR (avoiding one PR per bench run) or commits them
+/// to a new branch and opens one. Upstream file names mirror the local store
+/// names, so re-submitting after a partial failure skips what already landed
+/// instead of duplicating it. The caller is responsible for [`mark_shared`]
+/// afterwards.
+pub fn submit_stored(stored: &[StoredBenchmark], token: &str) -> Result<SubmitOutcome, String> {
+    if stored.is_empty() {
         return Err("no benchmark results to share".to_string());
     }
-    let submission = build_submission(results, specs);
-    let json =
-        serde_json::to_string_pretty(&submission).map_err(|e| format!("serialize failed: {e}"))?;
+
+    let now = now_unix();
+    let files = prepare_files(stored, now)?;
 
     let login = whoami(token)?;
-
     ensure_fork(token, &login)?;
-    let base_sha = upstream_head_sha(token)?;
 
-    let slug = hardware_slug(specs);
-    let hash = short_hash(&json);
+    // A lookup failure only means we open a fresh PR — never a lost result —
+    // so it is deliberately soft.
+    if let Some((branch, pr_url)) = find_open_bench_pr(token, &login).unwrap_or(None) {
+        let (uploaded, skipped) = put_files(token, &login, &branch, &files)?;
+        return Ok(SubmitOutcome {
+            pr_url: Some(pr_url),
+            reused_existing_pr: true,
+            uploaded,
+            skipped,
+        });
+    }
+
+    let base_sha = upstream_head_sha(token)?;
+    let all_json: String = files.iter().map(|(_, _, j)| j.as_str()).collect();
+    let hash = short_hash(&all_json);
+    let slug = files[0].0.clone();
     let branch = format!("bench/{slug}-{hash}");
     create_branch(token, &login, &branch, &base_sha)?;
 
-    let path = format!("{SUBMISSION_DIR}/{slug}/{}-{hash}.json", now_unix());
-    let message = format!(
-        "data: community benchmark ({} on {})",
-        results.first().map(|r| r.model.as_str()).unwrap_or("model"),
-        slug
-    );
-    put_file(token, &login, &branch, &path, &json, &message)?;
+    let (uploaded, skipped) = put_files(token, &login, &branch, &files)?;
+    if uploaded == 0 {
+        // Everything was already upstream (e.g. an earlier PR merged but the
+        // local move to shared/ failed). No diff — GitHub would reject a PR.
+        return Ok(SubmitOutcome {
+            pr_url: None,
+            reused_existing_pr: false,
+            uploaded,
+            skipped,
+        });
+    }
 
-    open_pr(token, &login, &branch, results, &slug)
+    let pr_url = open_pr(token, &login, &branch, stored, &slug)?;
+    Ok(SubmitOutcome {
+        pr_url: Some(pr_url),
+        reused_existing_pr: false,
+        uploaded,
+        skipped,
+    })
+}
+
+/// Build the upload set as `(hardware slug, file name, payload json)` per
+/// stored submission, re-stamping the submission time (stored files may be
+/// days old). Upstream file names reuse the local store name (record
+/// timestamp + content hash): stable across retries, so a re-upload of the
+/// same stored result targets the same path and is skipped, not duplicated.
+fn prepare_files(
+    stored: &[StoredBenchmark],
+    now: u64,
+) -> Result<Vec<(String, String, String)>, String> {
+    stored
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mut payload = s.payload.clone();
+            payload["submittedAtUnix"] = json!(now);
+            let json = serde_json::to_string_pretty(&payload)
+                .map_err(|e| format!("serialize failed: {e}"))?;
+            let name = s
+                .path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{now}-{i}.json"));
+            Ok((payload_slug(&payload), name, json))
+        })
+        .collect()
+}
+
+/// Commit each prepared file to `branch`, returning `(uploaded, skipped)`
+/// where skipped counts files that already existed upstream.
+fn put_files(
+    token: &str,
+    login: &str,
+    branch: &str,
+    files: &[(String, String, String)],
+) -> Result<(usize, usize), String> {
+    let (mut uploaded, mut skipped) = (0usize, 0usize);
+    for (slug, name, json) in files {
+        let path = format!("{SUBMISSION_DIR}/{slug}/{name}");
+        let message = format!("data: community benchmark ({slug})");
+        if put_file(token, login, branch, &path, json, &message)? {
+            uploaded += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+    Ok((uploaded, skipped))
 }
 
 fn confirm(prompt: &str) -> Result<bool, String> {
@@ -322,38 +613,90 @@ fn confirm(prompt: &str) -> Result<bool, String> {
 // Authentication
 // ---------------------------------------------------------------------------
 
+/// Where a non-interactively resolved token came from. An invalid env token
+/// is a hard error (the user set it explicitly); an invalid cached token is
+/// silently discarded and re-acquired via the device flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSource {
+    /// `GITHUB_TOKEN` / `GH_TOKEN` environment variable.
+    Env,
+    /// Token cached by a previous device-flow login.
+    Cache,
+}
+
 /// Resolve a GitHub token without any user interaction: env vars, then the
 /// cached token from a previous device-flow login. Returns `None` when an
 /// interactive login would be required.
 pub fn resolve_token_noninteractive() -> Option<String> {
+    resolve_token_noninteractive_with_source().map(|(t, _)| t)
+}
+
+/// [`resolve_token_noninteractive`], also reporting where the token came from.
+pub fn resolve_token_noninteractive_with_source() -> Option<(String, TokenSource)> {
     for var in ["GITHUB_TOKEN", "GH_TOKEN"] {
         if let Some(t) = std::env::var(var)
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
         {
-            return Some(t);
+            return Some((t, TokenSource::Env));
         }
     }
-    read_cached_token()
+    read_cached_token().map(|t| (t, TokenSource::Cache))
 }
 
-/// The OAuth App client id for the device flow, or `None` when only the
-/// unregistered placeholder is available (interactive login not possible).
-pub fn oauth_client_id() -> Option<String> {
-    let id = std::env::var("LLMFIT_GH_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
-    (id != DEFAULT_CLIENT_ID).then_some(id)
+/// Check a token against the GitHub API. `Ok(Some(login))` means the token is
+/// valid, `Ok(None)` means GitHub rejected it (invalid/expired), `Err` means
+/// the request itself failed (network, rate limit, ...).
+pub fn validate_token(token: &str) -> Result<Option<String>, String> {
+    let (status, body) = api("GET", &format!("{API}/user"), token, None)?;
+    if status == 401 {
+        return Ok(None);
+    }
+    if !(200..300).contains(&status) {
+        return Err(api_error(status, &body));
+    }
+    Ok(Some(
+        body["login"]
+            .as_str()
+            .ok_or("could not determine GitHub username")?
+            .to_string(),
+    ))
 }
 
-/// Persist a token obtained via the device flow for future runs.
-pub fn cache_token(token: &str) -> Result<(), String> {
-    write_cached_token(token)
+/// Drop the cached device-flow token (e.g. after GitHub reports it expired).
+pub fn clear_cached_token() {
+    if let Some(p) = token_path() {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
-/// Resolve a GitHub token: env var, then cached token, then interactive device flow.
-fn resolve_token() -> Result<String, String> {
-    if let Some(t) = resolve_token_noninteractive() {
-        return Ok(t);
+/// Resolve *and verify* GitHub credentials, intended to run **before** any
+/// benchmarks so a missing or expired token is caught up front rather than
+/// after minutes of benching. Falls back to the interactive device flow when
+/// possible. Prints progress to stderr (CLI flow).
+pub fn preflight_auth() -> Result<String, String> {
+    if let Some((token, source)) = resolve_token_noninteractive_with_source() {
+        match validate_token(&token) {
+            Ok(Some(login)) => {
+                eprintln!("  GitHub: authenticated as {login}");
+                return Ok(token);
+            }
+            Ok(None) => match source {
+                TokenSource::Env => {
+                    return Err(
+                        "the GITHUB_TOKEN/GH_TOKEN environment variable holds an invalid \
+                         or expired token"
+                            .to_string(),
+                    );
+                }
+                TokenSource::Cache => {
+                    eprintln!("  GitHub: cached login has expired — starting a new login");
+                    clear_cached_token();
+                }
+            },
+            Err(e) => return Err(format!("could not verify GitHub credentials: {e}")),
+        }
     }
     let Some(client_id) = oauth_client_id() else {
         return Err(
@@ -368,6 +711,18 @@ fn resolve_token() -> Result<String, String> {
         eprintln!("  Warning: could not cache token: {e}");
     }
     Ok(token)
+}
+
+/// The OAuth App client id for the device flow, or `None` when only the
+/// unregistered placeholder is available (interactive login not possible).
+pub fn oauth_client_id() -> Option<String> {
+    let id = std::env::var("LLMFIT_GH_CLIENT_ID").unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
+    (id != DEFAULT_CLIENT_ID).then_some(id)
+}
+
+/// Persist a token obtained via the device flow for future runs.
+pub fn cache_token(token: &str) -> Result<(), String> {
+    write_cached_token(token)
 }
 
 fn token_path() -> Option<std::path::PathBuf> {
@@ -560,17 +915,7 @@ fn api_error(status: u16, body: &Value) -> String {
 }
 
 fn whoami(token: &str) -> Result<String, String> {
-    let (status, body) = api("GET", &format!("{API}/user"), token, None)?;
-    if status == 401 {
-        return Err("GitHub token is invalid or expired (401)".into());
-    }
-    if !(200..300).contains(&status) {
-        return Err(api_error(status, &body));
-    }
-    body["login"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| "could not determine GitHub username".into())
+    validate_token(token)?.ok_or_else(|| "GitHub token is invalid or expired (401)".into())
 }
 
 /// Ensure the authenticated user has a fork of the upstream repo, creating one
@@ -627,6 +972,11 @@ fn create_branch(token: &str, login: &str, branch: &str, sha: &str) -> Result<()
     Err(api_error(status, &body))
 }
 
+/// Create `path` on `branch`. Returns `Ok(true)` when the file was written,
+/// `Ok(false)` when it already exists there — creating over an existing path
+/// makes GitHub answer 422 `"sha" wasn't supplied`, which for our
+/// content-hash-named submissions means this exact result already landed in
+/// an earlier attempt.
 fn put_file(
     token: &str,
     login: &str,
@@ -634,7 +984,7 @@ fn put_file(
     path: &str,
     content: &str,
     message: &str,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let encoded = base64::engine::general_purpose::STANDARD.encode(content);
     let url = format!("{API}/repos/{login}/{UPSTREAM_REPO}/contents/{path}");
     let body = json!({
@@ -643,17 +993,47 @@ fn put_file(
         "branch": branch,
     });
     let (status, body) = api("PUT", &url, token, Some(&body))?;
+    if status == 422 && body["message"].as_str().is_some_and(|m| m.contains("sha")) {
+        return Ok(false);
+    }
     if !(200..300).contains(&status) {
         return Err(api_error(status, &body));
     }
-    Ok(())
+    Ok(true)
+}
+
+/// First open upstream PR whose head is one of this user's `bench/…`
+/// branches, as `(branch, html_url)`.
+fn find_open_bench_pr(token: &str, login: &str) -> Result<Option<(String, String)>, String> {
+    let url = format!("{API}/repos/{UPSTREAM_OWNER}/{UPSTREAM_REPO}/pulls?state=open&per_page=100");
+    let (status, body) = api("GET", &url, token, None)?;
+    if !(200..300).contains(&status) {
+        return Err(api_error(status, &body));
+    }
+    Ok(open_bench_pr_in(&body, login))
+}
+
+/// Pure matcher over a GitHub pull-list response: this user's first open
+/// `bench/…` PR, if any.
+fn open_bench_pr_in(prs: &Value, login: &str) -> Option<(String, String)> {
+    let prefix = format!("{login}:bench/");
+    prs.as_array()?.iter().find_map(|pr| {
+        let label = pr["head"]["label"].as_str()?;
+        if !label.starts_with(&prefix) {
+            return None;
+        }
+        Some((
+            pr["head"]["ref"].as_str()?.to_string(),
+            pr["html_url"].as_str()?.to_string(),
+        ))
+    })
 }
 
 fn open_pr(
     token: &str,
     login: &str,
     branch: &str,
-    results: &[BenchResult],
+    stored: &[StoredBenchmark],
     slug: &str,
 ) -> Result<String, String> {
     let title = format!("bench: community results for {slug}");
@@ -662,16 +1042,21 @@ fn open_pr(
          | Model | Provider | Avg TPS | Avg TTFT (ms) |\n\
          | --- | --- | --- | --- |\n",
     );
-    for r in results {
-        let ttft = r
-            .summary
-            .avg_ttft_ms
-            .map(|v| format!("{v:.1}"))
-            .unwrap_or_else(|| "—".to_string());
-        body.push_str(&format!(
-            "| {} | {} | {:.1} | {} |\n",
-            r.model, r.provider, r.summary.avg_tps, ttft
-        ));
+    for s in stored {
+        let results = s.payload["results"].as_array();
+        for r in results.map(|v| v.as_slice()).unwrap_or_default() {
+            let ttft = r["avgTtftMs"]
+                .as_f64()
+                .map(|v| format!("{v:.1}"))
+                .unwrap_or_else(|| "—".to_string());
+            body.push_str(&format!(
+                "| {} | {} | {:.1} | {} |\n",
+                r["model"].as_str().unwrap_or("?"),
+                r["provider"].as_str().unwrap_or("?"),
+                r["avgTps"].as_f64().unwrap_or(0.0),
+                ttft
+            ));
+        }
     }
     body.push_str("\n_Submitted without the `gh` CLI via the GitHub device flow._\n");
 
@@ -722,14 +1107,145 @@ mod tests {
         }
     }
 
+    fn sample_result() -> BenchResult {
+        use crate::bench::BenchSummary;
+        BenchResult {
+            model: "llama3.1:8b".to_string(),
+            provider: "ollama".to_string(),
+            runs: vec![],
+            summary: BenchSummary {
+                num_runs: 3,
+                avg_ttft_ms: Some(41.2),
+                avg_tps: 128.44,
+                min_tps: 121.0,
+                max_tps: 133.7,
+                avg_total_ms: 812.5,
+                avg_output_tokens: 104.0,
+            },
+        }
+    }
+
     #[test]
     fn slug_is_filename_safe() {
-        let specs = specs_with_gpu("NVIDIA RTX 4090!!");
-        let slug = hardware_slug(&specs);
+        let submission = build_submission(&[sample_result()], &specs_with_gpu("NVIDIA RTX 4090!!"));
+        let payload = serde_json::to_value(&submission).unwrap();
+        let slug = payload_slug(&payload);
         assert!(slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
         assert!(!slug.contains("--"));
         assert!(!slug.starts_with('-') && !slug.ends_with('-'));
         assert_eq!(slug, "nvidia-rtx-4090");
+
+        // No GPU name → falls back to a cpu-derived slug.
+        let mut cpu_only = specs_with_gpu("unused");
+        cpu_only.gpu_name = None;
+        let payload =
+            serde_json::to_value(build_submission(&[sample_result()], &cpu_only)).unwrap();
+        assert_eq!(payload_slug(&payload), "cpu-test-cpu");
+    }
+
+    #[test]
+    fn open_bench_pr_matcher_picks_own_bench_branch_only() {
+        let prs = json!([
+            // Someone else's bench PR — must not match.
+            {"head": {"label": "otheruser:bench/rtx-4090-aaaa", "ref": "bench/rtx-4090-aaaa"},
+             "html_url": "https://github.com/AlexsJones/llmfit/pull/1"},
+            // Our PR but not a bench branch — must not match.
+            {"head": {"label": "me:fix/typo", "ref": "fix/typo"},
+             "html_url": "https://github.com/AlexsJones/llmfit/pull/2"},
+            // Ours — match.
+            {"head": {"label": "me:bench/rtx-4090-bbbb", "ref": "bench/rtx-4090-bbbb"},
+             "html_url": "https://github.com/AlexsJones/llmfit/pull/3"},
+        ]);
+        assert_eq!(
+            open_bench_pr_in(&prs, "me"),
+            Some((
+                "bench/rtx-4090-bbbb".to_string(),
+                "https://github.com/AlexsJones/llmfit/pull/3".to_string()
+            ))
+        );
+        assert_eq!(open_bench_pr_in(&prs, "nobody"), None);
+        assert_eq!(open_bench_pr_in(&json!([]), "me"), None);
+        assert_eq!(
+            open_bench_pr_in(&json!({"message": "rate limited"}), "me"),
+            None
+        );
+    }
+
+    #[test]
+    fn prepare_files_restamps_and_keeps_stable_names() {
+        let submission = build_submission(
+            &[sample_result()],
+            &specs_with_gpu("NVIDIA GeForce RTX 4090"),
+        );
+        let stored = StoredBenchmark {
+            path: PathBuf::from("/store/pending/1752100000-abcd1234.json"),
+            payload: serde_json::to_value(&submission).unwrap(),
+        };
+
+        let files = prepare_files(std::slice::from_ref(&stored), 9_999_999_999).unwrap();
+        assert_eq!(files.len(), 1);
+        let (slug, name, json) = &files[0];
+        assert_eq!(slug, "nvidia-geforce-rtx-4090");
+        // Upstream name mirrors the local store file, so retries are idempotent.
+        assert_eq!(name, "1752100000-abcd1234.json");
+        let payload: Value = serde_json::from_str(json).unwrap();
+        assert_eq!(payload["submittedAtUnix"], 9_999_999_999u64);
+        // Identical input at the same submit time → identical prepared file.
+        let again = prepare_files(std::slice::from_ref(&stored), 9_999_999_999).unwrap();
+        assert_eq!(&again[0].2, json);
+    }
+
+    #[test]
+    fn local_store_roundtrip() {
+        // LLMFIT_BENCH_STORE scopes the store to a temp dir. Env vars are
+        // process-global, so this is the only test that may touch the store.
+        let dir = std::env::temp_dir().join(format!("llmfit-store-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        unsafe { std::env::set_var("LLMFIT_BENCH_STORE", &dir) };
+
+        let specs = specs_with_gpu("NVIDIA GeForce RTX 4090");
+        let path = store_local(&[sample_result()], &specs).unwrap();
+        assert!(path.starts_with(dir.join("pending")));
+
+        let pending = pending_benchmarks();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].payload["schemaVersion"], 1);
+        assert_eq!(
+            pending[0].result_lines(),
+            vec!["llama3.1:8b via ollama — 128.4 tok/s".to_string()]
+        );
+        assert!(shared_benchmarks().is_empty());
+
+        // The local index resolves the stored run for the matching catalog
+        // model (ollama tag "llama3.1:8b" ↔ HF-style name) and outranks
+        // nothing else: unknown models get no local measurement.
+        let idx = LocalBenchIndex::load(&specs).expect("store has one run");
+        let m = idx.lookup("test/llama-3.1-8b").expect("tag should match");
+        assert_eq!(m.tok_s, 128.44);
+        assert_eq!(m.sample_count, 1);
+        assert_eq!(m.source, crate::benchmarks::MeasuredSource::LocalBench);
+        assert!(idx.lookup("test/qwen2.5-7b").is_none());
+
+        // Runs recorded on different hardware never leak into the index.
+        let other_gpu = specs_with_gpu("NVIDIA GeForce RTX 3060");
+        assert!(LocalBenchIndex::load(&other_gpu).is_none());
+        assert!(!pending[0].matches_hardware(&other_gpu));
+        assert!(pending[0].matches_hardware(&specs));
+
+        mark_shared(&pending);
+        // Shared runs still count as local measurements.
+        assert!(
+            LocalBenchIndex::load(&specs)
+                .and_then(|i| i.lookup("test/llama-3.1-8b"))
+                .is_some()
+        );
+        assert!(pending_benchmarks().is_empty());
+        let shared = shared_benchmarks();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].payload["results"][0]["avgTps"], 128.44);
+
+        unsafe { std::env::remove_var("LLMFIT_BENCH_STORE") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

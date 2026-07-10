@@ -554,16 +554,34 @@ fn display_estimate_basis(fit: &ModelFit) {
     }
 
     if let Some(m) = &fit.measured_tps {
-        println!("{}", "Measured on Matching Hardware:".bold().underline());
-        println!(
-            "  {:.1} tok/s median across {} community run(s) on {} (localmaxxing.com)",
-            m.tok_s, m.sample_count, m.hardware_label
-        );
-        println!("  Real user data — trust this over the formula estimate below.");
+        match m.source {
+            llmfit_core::benchmarks::MeasuredSource::LocalBench => {
+                println!("{}", "Measured on This Machine:".bold().underline());
+                println!(
+                    "  {:.1} tok/s from your own `llmfit bench` run(s) ({} stored)",
+                    m.tok_s, m.sample_count
+                );
+                println!("  Your measurement — trust this over the formula estimate below.");
+            }
+            llmfit_core::benchmarks::MeasuredSource::Community => {
+                println!("{}", "Measured on Matching Hardware:".bold().underline());
+                println!(
+                    "  {:.1} tok/s median across {} community run(s) on {} (localmaxxing.com)",
+                    m.tok_s, m.sample_count, m.hardware_label
+                );
+                println!("  Real user data — trust this over the formula estimate below.");
+            }
+        }
         println!();
     }
 
     println!("{}", "Estimate Basis:".bold().underline());
+    if let Some(c) = basis.local_calibration {
+        println!(
+            "  Calibrated x{:.2} from your own `llmfit bench` run(s) on this machine",
+            c
+        );
+    }
     match basis.method.as_str() {
         "gpu_bandwidth_roofline" => {
             let bw = basis.gpu_bandwidth_gbps.unwrap_or(0.0);

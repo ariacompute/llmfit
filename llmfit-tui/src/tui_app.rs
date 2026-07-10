@@ -358,26 +358,7 @@ pub enum BenchOfferState {
 /// (".../gemma-3.Q8_0.gguf") get exact stem matching only — feeding a bare
 /// stem into the Ollama candidate heuristics would match whole families.
 fn bench_target_matches(target_model: &str, hf_name: &str) -> bool {
-    let lower = target_model.to_lowercase();
-
-    let mut tag_set = HashSet::new();
-    tag_set.insert(lower.clone());
-    if llmfit_core::providers::is_model_installed(hf_name, &tag_set) {
-        return true;
-    }
-
-    let stem = lower
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(&lower)
-        .trim_end_matches(".gguf")
-        .to_string();
-    let mut stem_set = HashSet::new();
-    if let Some(base) = llmfit_core::providers::strip_gguf_quant_suffix(&stem) {
-        stem_set.insert(base);
-    }
-    stem_set.insert(stem);
-    llmfit_core::providers::is_model_installed_llamacpp(hf_name, &stem_set)
+    llmfit_core::providers::tag_matches_model(target_model, hf_name)
 }
 
 /// Body of the bench-offer worker thread: find the selected model on a running
@@ -426,6 +407,26 @@ fn bench_offer_worker(
         .unwrap_or(tag)
         .trim_end_matches(".gguf")
         .to_string();
+
+    // Resolve and verify GitHub credentials BEFORE the benchmark runs, so a
+    // missing or expired token (or the device-flow prompt) surfaces while the
+    // user is still watching — not after minutes of benching. A credential
+    // problem never aborts the bench: it downgrades to save-locally.
+    let mut share_note: Option<String> = None;
+    let share_token: Option<String> = if share {
+        let _ = tx.send(BenchOfferMsg::Progress(
+            "Checking GitHub credentials...".into(),
+        ));
+        match tui_share_auth(tx) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                share_note = Some(format!("Share skipped: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let progress_tx = tx.clone();
     let tag_for_progress = display_tag.clone();
@@ -478,91 +479,121 @@ fn bench_offer_worker(
         provider,
     );
 
-    if !share {
+    // Always record the run locally; sharing (now or later) uploads from the
+    // pending store, so declining to share never discards the result.
+    let store_err = share::store_local(std::slice::from_ref(&result), specs).err();
+
+    let Some(token) = share_token else {
+        let mut note = share_note.unwrap_or_default();
+        if !note.is_empty() {
+            note.push(' ');
+        }
+        match store_err {
+            None => {
+                let pending = share::pending_benchmarks().len();
+                note.push_str(&format!(
+                    "Saved locally ({pending} pending) — share any time with \
+                     `llmfit bench --share`."
+                ));
+            }
+            Some(e) => note.push_str(&format!("Warning: could not save result locally: {e}")),
+        }
         let _ = tx.send(BenchOfferMsg::Done {
             summary,
             pr_url: None,
-            share_note: None,
+            share_note: Some(note),
         });
         return;
-    }
-
-    // Share flow: cached/env token first, then interactive device flow with
-    // the code rendered inside the modal.
-    let _ = tx.send(BenchOfferMsg::Progress("Sharing with llmfit...".into()));
-    let token = match share::resolve_token_noninteractive() {
-        Some(t) => t,
-        None => {
-            let Some(client_id) = share::oauth_client_id() else {
-                let _ = tx.send(BenchOfferMsg::Done {
-                    summary,
-                    pr_url: None,
-                    share_note: Some(
-                        "Share skipped: no GitHub token. Set GITHUB_TOKEN or run \
-                         `llmfit bench --share` once to log in."
-                            .into(),
-                    ),
-                });
-                return;
-            };
-            let auth = match share::device_flow_start(&client_id) {
-                Ok(a) => a,
-                Err(e) => {
-                    let _ = tx.send(BenchOfferMsg::Done {
-                        summary,
-                        pr_url: None,
-                        share_note: Some(format!("Share skipped: {}", e)),
-                    });
-                    return;
-                }
-            };
-            let _ = tx.send(BenchOfferMsg::AuthCode {
-                user_code: auth.user_code.clone(),
-                verification_uri: auth.verification_uri.clone(),
-            });
-            let mut interval = auth.interval;
-            loop {
-                thread::sleep(std::time::Duration::from_secs(interval + 1));
-                match share::device_flow_poll(&client_id, &auth.device_code) {
-                    Ok(share::DevicePoll::Token(t)) => {
-                        let _ = share::cache_token(&t);
-                        break t;
-                    }
-                    Ok(share::DevicePoll::Pending) => continue,
-                    Ok(share::DevicePoll::SlowDown) => {
-                        interval += 5;
-                        continue;
-                    }
-                    Ok(share::DevicePoll::Failed(e)) | Err(e) => {
-                        let _ = tx.send(BenchOfferMsg::Done {
-                            summary,
-                            pr_url: None,
-                            share_note: Some(format!("Share skipped: {}", e)),
-                        });
-                        return;
-                    }
-                }
-            }
-        }
     };
 
-    let _ = tx.send(BenchOfferMsg::Progress(
-        "Opening pull request on GitHub...".into(),
-    ));
-    match share::submit_results(std::slice::from_ref(&result), specs, &token) {
-        Ok(pr_url) => {
+    // Upload the entire pending store: this run plus anything stored earlier.
+    let stored = share::pending_benchmarks();
+    let _ = tx.send(BenchOfferMsg::Progress(format!(
+        "Opening pull request on GitHub ({} submission(s))...",
+        stored.len()
+    )));
+    match share::submit_stored(&stored, &token) {
+        Ok(outcome) => {
+            share::mark_shared(&stored);
+            let mut notes: Vec<String> = Vec::new();
+            if outcome.reused_existing_pr {
+                notes.push(format!(
+                    "Added {} result(s) to your open benchmark PR.",
+                    outcome.uploaded
+                ));
+            }
+            if outcome.skipped > 0 {
+                notes.push(format!(
+                    "{} previously submitted result(s) skipped.",
+                    outcome.skipped
+                ));
+            }
+            if outcome.pr_url.is_none() {
+                notes.push("All results were already contributed upstream.".to_string());
+            }
             let _ = tx.send(BenchOfferMsg::Done {
                 summary,
-                pr_url: Some(pr_url),
-                share_note: None,
+                pr_url: outcome.pr_url,
+                share_note: (!notes.is_empty()).then(|| notes.join(" ")),
             });
         }
         Err(e) => {
             let _ = tx.send(BenchOfferMsg::Done {
                 summary,
                 pr_url: None,
-                share_note: Some(format!("Share failed: {}", e)),
+                share_note: Some(format!(
+                    "Share failed: {e}. Results remain stored locally — retry with \
+                     `llmfit bench --share`."
+                )),
             });
+        }
+    }
+}
+
+/// Resolve a *validated* GitHub token for the TUI share flow: env or cached
+/// token (verified against the API), falling back to the device flow with the
+/// code rendered inside the modal. Runs before the benchmark so credential
+/// problems surface immediately.
+fn tui_share_auth(tx: &mpsc::Sender<BenchOfferMsg>) -> Result<String, String> {
+    use llmfit_core::share;
+
+    if let Some((token, source)) = share::resolve_token_noninteractive_with_source() {
+        match share::validate_token(&token) {
+            Ok(Some(_login)) => return Ok(token),
+            Ok(None) => match source {
+                share::TokenSource::Env => {
+                    return Err("GITHUB_TOKEN/GH_TOKEN is invalid or expired.".into());
+                }
+                // Stale cached login — drop it and fall through to a fresh
+                // device-flow authorization.
+                share::TokenSource::Cache => share::clear_cached_token(),
+            },
+            Err(e) => return Err(format!("could not reach GitHub: {e}.")),
+        }
+    }
+
+    let Some(client_id) = share::oauth_client_id() else {
+        return Err("no GitHub token. Set GITHUB_TOKEN or GH_TOKEN.".into());
+    };
+    let auth = share::device_flow_start(&client_id)?;
+    let _ = tx.send(BenchOfferMsg::AuthCode {
+        user_code: auth.user_code.clone(),
+        verification_uri: auth.verification_uri.clone(),
+    });
+    let mut interval = auth.interval;
+    loop {
+        thread::sleep(std::time::Duration::from_secs(interval + 1));
+        match share::device_flow_poll(&client_id, &auth.device_code) {
+            Ok(share::DevicePoll::Token(t)) => {
+                let _ = share::cache_token(&t);
+                return Ok(t);
+            }
+            Ok(share::DevicePoll::Pending) => continue,
+            Ok(share::DevicePoll::SlowDown) => {
+                interval += 5;
+                continue;
+            }
+            Ok(share::DevicePoll::Failed(e)) | Err(e) => return Err(e),
         }
     }
 }
@@ -1009,6 +1040,12 @@ pub struct App {
     // Bench-offer modal (benchmark the selected model, optionally share as PR)
     pub bench_offer_state: BenchOfferState,
     pub bench_offer_share: bool,
+    /// Locally stored submissions that a share would also upload.
+    pub bench_offer_pending: usize,
+    /// Why sharing cannot work right now (no token and no OAuth client id);
+    /// `None` when sharing is possible. Checked when the modal opens so the
+    /// user learns about missing credentials before benchmarking.
+    pub bench_offer_share_unavailable: Option<String>,
     /// HF-style name of the model being offered for benchmark.
     pub bench_offer_model: String,
     /// Providers that have the model installed (display names).
@@ -1135,6 +1172,8 @@ impl App {
 
         // Only analyze models that can actually run on this hardware.
         let measured_index = llmfit_core::benchmarks::MeasuredTpsIndex::for_specs(&specs);
+        // The user's own `llmfit bench` runs trump community medians.
+        let local_index = llmfit_core::share::LocalBenchIndex::load(&specs);
         let mut all_fits: Vec<ModelFit> = db
             .get_all_models()
             .iter()
@@ -1142,12 +1181,20 @@ impl App {
             .map(|m| {
                 let mut fit = ModelFit::analyze_with_context_limit(m, &specs, context_limit);
                 fit.installed = installed.is_installed(&m.name);
-                fit.measured_tps = measured_index
+                fit.measured_tps = local_index
                     .as_ref()
-                    .and_then(|idx| idx.lookup(&m.name, &fit.best_quant));
+                    .and_then(|idx| idx.lookup(&m.name))
+                    .or_else(|| {
+                        measured_index
+                            .as_ref()
+                            .and_then(|idx| idx.lookup(&m.name, &fit.best_quant))
+                    });
                 fit
             })
             .collect();
+
+        // Calibrate formula estimates from the user's own benchmark runs.
+        llmfit_core::analysis::apply_local_calibration(&mut all_fits);
 
         // Sort by fit level then RAM usage
         all_fits = llmfit_core::fit::rank_models_by_fit(all_fits);
@@ -1468,6 +1515,8 @@ impl App {
             // Bench-offer modal
             bench_offer_state: BenchOfferState::Offer,
             bench_offer_share: false,
+            bench_offer_pending: 0,
+            bench_offer_share_unavailable: None,
             bench_offer_model: String::new(),
             bench_offer_providers: Vec::new(),
             bench_offer_progress: String::new(),
@@ -2320,6 +2369,17 @@ impl App {
                 self.bench_offer_state = BenchOfferState::Offer;
                 self.bench_offer_model = name;
                 self.bench_offer_providers = providers;
+                self.bench_offer_pending = llmfit_core::share::pending_benchmarks().len();
+                // Cheap offline check (env var + cached-token file) so the
+                // modal can flag missing credentials before a bench starts.
+                self.bench_offer_share_unavailable =
+                    if llmfit_core::share::resolve_token_noninteractive().is_some()
+                        || llmfit_core::share::oauth_client_id().is_some()
+                    {
+                        None
+                    } else {
+                        Some("no GitHub credentials (set GITHUB_TOKEN)".to_string())
+                    };
                 self.bench_offer_progress = String::new();
                 self.bench_offer_auth = None;
                 self.bench_offer_summary = None;
@@ -2330,9 +2390,16 @@ impl App {
             }
         }
 
-        // Fetch if we don't have data yet
-        if self.bench_entries.is_empty() && !self.bench_loading {
+        // Fetch if we have no server data yet (pinned local rows don't count)
+        let has_server_rows = self
+            .bench_entries
+            .iter()
+            .any(|e| !e.id.starts_with("local:"));
+        if !has_server_rows && !self.bench_loading {
             self.fetch_benchmarks();
+        } else {
+            // Cached board — still refresh the pinned local rows.
+            self.merge_local_bench_rows();
         }
     }
 
@@ -2342,7 +2409,12 @@ impl App {
     }
 
     /// Toggle the "share with llmfit" checkbox in the bench-offer modal.
+    /// A no-op when sharing is unavailable (the modal shows why).
     pub fn bench_offer_toggle_share(&mut self) {
+        if self.bench_offer_share_unavailable.is_some() {
+            self.bench_offer_share = false;
+            return;
+        }
         self.bench_offer_share = !self.bench_offer_share;
     }
 
@@ -2381,7 +2453,12 @@ impl App {
         if let Some(rx) = &self.bench_offer_rx {
             while let Ok(msg) = rx.try_recv() {
                 match msg {
-                    BenchOfferMsg::Progress(s) => self.bench_offer_progress = s,
+                    BenchOfferMsg::Progress(s) => {
+                        // Any progress after the auth prompt means the device
+                        // flow completed — stop showing the code.
+                        self.bench_offer_auth = None;
+                        self.bench_offer_progress = s;
+                    }
                     BenchOfferMsg::AuthCode {
                         user_code,
                         verification_uri,
@@ -2411,6 +2488,98 @@ impl App {
         }
         if finished {
             self.bench_offer_rx = None;
+            // The worker stored (and possibly shared) a new local result —
+            // refresh the local rows pinned to the leaderboard behind the
+            // modal and the measured tok/s shown in the main table.
+            self.merge_local_bench_rows();
+            self.refresh_local_measured_tps();
+        }
+    }
+
+    /// Re-annotate fit rows with the latest local benchmark measurements so
+    /// the main table's tok/s column reflects a just-finished bench without a
+    /// restart. Only upgrades rows a local run matches; community-measured
+    /// values elsewhere are left alone. Estimate calibration is then
+    /// recomputed (idempotently) from the updated anchors.
+    pub fn refresh_local_measured_tps(&mut self) {
+        // Same specs the fits were built with: under simulated hardware the
+        // stored runs won't match, so simulated estimates stay untouched.
+        if let Some(idx) = llmfit_core::share::LocalBenchIndex::load(&self.specs) {
+            for fit in &mut self.all_fits {
+                if let Some(m) = idx.lookup(&fit.model.name) {
+                    fit.measured_tps = Some(m);
+                }
+            }
+        }
+        llmfit_core::analysis::apply_local_calibration(&mut self.all_fits);
+    }
+
+    /// Rebuild the "your local results" rows pinned at the top of the
+    /// leaderboard: stored submissions (pending and already shared) rendered
+    /// as `local:`-prefixed entries attributed to "you". Skipped while
+    /// browsing a hardware preset other than this machine.
+    pub fn merge_local_bench_rows(&mut self) {
+        use llmfit_core::benchmarks::{
+            LeaderboardEngine, LeaderboardEntry, LeaderboardModel, LeaderboardUser,
+        };
+
+        self.bench_entries.retain(|e| !e.id.starts_with("local:"));
+        if self.bench_hw_label.is_some() {
+            return;
+        }
+
+        let mut local: Vec<LeaderboardEntry> = Vec::new();
+        let stores = [
+            ("you (local)", llmfit_core::share::pending_benchmarks()),
+            ("you (shared)", llmfit_core::share::shared_benchmarks()),
+        ];
+        for (who, stored) in &stores {
+            for s in stored {
+                let Some(results) = s.payload["results"].as_array() else {
+                    continue;
+                };
+                for (i, r) in results.iter().enumerate() {
+                    local.push(LeaderboardEntry {
+                        id: format!("local:{}:{i}", s.path.display()),
+                        tok_s_out: r["avgTps"].as_f64(),
+                        tok_s_total: None,
+                        ttft_ms: r["avgTtftMs"].as_f64(),
+                        context_length: None,
+                        batch_size: None,
+                        peak_vram_gb: None,
+                        notes: None,
+                        model: Some(LeaderboardModel {
+                            hf_id: r["model"].as_str().unwrap_or("?").to_string(),
+                            display_name: None,
+                            family: None,
+                            params: None,
+                            is_mo_e: None,
+                        }),
+                        hardware: None,
+                        engine: Some(LeaderboardEngine {
+                            engine_name: r["provider"].as_str().unwrap_or("").to_string(),
+                            engine_version: None,
+                            quantization: String::new(),
+                            backend: None,
+                        }),
+                        engine_flags: None,
+                        user: Some(LeaderboardUser {
+                            username: Some((*who).to_string()),
+                            verified: None,
+                        }),
+                    });
+                }
+            }
+        }
+        if local.is_empty() {
+            return;
+        }
+        // Newest first, pinned above the fetched leaderboard.
+        local.reverse();
+        local.append(&mut self.bench_entries);
+        self.bench_entries = local;
+        if self.bench_cursor >= self.bench_entries.len() {
+            self.bench_cursor = self.bench_entries.len().saturating_sub(1);
         }
     }
 
@@ -2438,6 +2607,8 @@ impl App {
                 }
             }
         }
+        // Local results render even when the API is unreachable.
+        self.merge_local_bench_rows();
     }
 
     pub fn bench_move_up(&mut self) {
@@ -2540,6 +2711,7 @@ impl App {
                     }
                 }
             }
+            self.merge_local_bench_rows();
         }
 
         self.bench_cursor = 0;

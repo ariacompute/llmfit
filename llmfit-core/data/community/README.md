@@ -6,11 +6,15 @@ This directory collects benchmark results contributed by llmfit users via:
 llmfit bench --all --share
 ```
 
-`--share` runs a benchmark sweep, shows you the exact JSON payload, asks for
-confirmation, then opens a pull request adding one file here — **without needing
-the `gh` CLI**. Authentication uses the GitHub OAuth *device flow* (the same
-mechanism `gh auth login` uses); a `GITHUB_TOKEN` / `GH_TOKEN` env var is used
-automatically when present (e.g. in CI).
+`--share` runs a benchmark sweep, shows you the exact JSON payloads, asks for
+confirmation, then opens a pull request adding the files here — **without
+needing the `gh` CLI**. Authentication uses the GitHub OAuth *device flow* (the
+same mechanism `gh auth login` uses); a `GITHUB_TOKEN` / `GH_TOKEN` env var is
+used automatically when present (e.g. in CI).
+
+Bench runs made **without** `--share` are kept in a local store on the user's
+machine; a later `llmfit bench --share` (with nothing else to bench) uploads
+that stored backlog in one PR, so declining to share never discards data.
 
 Preview what would be submitted without contacting GitHub:
 
@@ -27,7 +31,11 @@ community/
 ```
 
 Files are namespaced by hardware and carry a content hash so concurrent
-submissions never collide.
+submissions never collide. Each file name mirrors the contributor's local
+store entry, which makes submissions idempotent: if a contributor already has
+an open benchmark PR, new results are appended to it (instead of opening
+another PR), and a retry after a partial failure skips files that already
+landed rather than duplicating them.
 
 ## Format
 
