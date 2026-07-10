@@ -2803,7 +2803,14 @@ pub fn strip_gguf_quant_suffix(stem: &str) -> Option<String> {
     ];
     for pat in &quant_patterns {
         if let Some(pos) = stem.rfind(pat) {
-            return Some(stem[..pos].to_string());
+            let base = &stem[..pos];
+            // Unsloth "Dynamic" GGUFs embed a `-ud` marker between the model
+            // name and the quant (e.g. `qwen3.6-35b-a3b-ud-q4_k_m`). It is not
+            // part of the canonical model name, so strip it too — otherwise the
+            // stem never reduces to the catalog id and the file reads as neither
+            // installed nor served.
+            let base = base.strip_suffix("-ud").unwrap_or(base);
+            return Some(base.to_string());
         }
     }
     None
@@ -4397,6 +4404,48 @@ mod tests {
         assert!(is_model_installed_llamacpp(
             "meta-llama/Llama-3.1-8B-Instruct",
             &installed
+        ));
+    }
+
+    #[test]
+    fn test_strip_gguf_quant_suffix_unsloth_ud_marker() {
+        // Unsloth "Dynamic" GGUFs carry a `-ud` marker before the quant; it
+        // must be stripped alongside the quant so the stem reduces to the
+        // canonical model name.
+        assert_eq!(
+            strip_gguf_quant_suffix("qwen3.6-35b-a3b-ud-q4_k_m").as_deref(),
+            Some("qwen3.6-35b-a3b")
+        );
+        // Non-Unsloth files are unaffected.
+        assert_eq!(
+            strip_gguf_quant_suffix("qwen2.5-7b-instruct-q4_k_m").as_deref(),
+            Some("qwen2.5-7b-instruct")
+        );
+    }
+
+    #[test]
+    fn test_is_model_installed_llamacpp_unsloth_ud() {
+        // `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` on disk yields these set entries
+        // (see `installed_models_counted`) and must mark the catalog model as
+        // installed despite the embedded `-ud` marker.
+        let installed: HashSet<String> = ["qwen3.6-35b-a3b-ud-q4_k_m", "qwen3.6-35b-a3b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(is_model_installed_llamacpp(
+            "Qwen/Qwen3.6-35B-A3B",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_tag_matches_model_unsloth_ud_gguf() {
+        // End-to-end: a llama-server serving an Unsloth UD GGUF reports the
+        // file name as the model id; it must match the catalog HF name so the
+        // model is benchmarkable (regression: `-ud` broke the exact stem match).
+        assert!(tag_matches_model(
+            "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf",
+            "Qwen/Qwen3.6-35B-A3B"
         ));
     }
 
