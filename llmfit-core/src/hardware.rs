@@ -2065,12 +2065,12 @@ impl SystemSpecs {
     pub fn with_ram_override(mut self, ram_gb: f64) -> Self {
         self.total_ram_gb = ram_gb;
         self.available_ram_gb = ram_gb * 0.9;
+        // The detected GPU-available cap describes the real host, not the
+        // simulated one; clear it rather than report a stale figure.
+        self.gpu_available_gb = None;
         if self.unified_memory {
             self.gpu_vram_gb = Some(ram_gb);
             self.total_gpu_vram_gb = Some(ram_gb);
-            // The detected GPU-available cap describes the real host, not the
-            // simulated one; clear it rather than report a stale figure.
-            self.gpu_available_gb = None;
             for gpu in &mut self.gpus {
                 if gpu.unified_memory {
                     gpu.vram_gb = Some(ram_gb);
@@ -2162,7 +2162,10 @@ impl SystemSpecs {
 
 /// Format the unified-memory GPU line. When the GPU-available figure is known
 /// (Apple Silicon), it is shown alongside the total shared pool; otherwise the
-/// line falls back to reporting the shared pool alone.
+/// line falls back to reporting the shared pool alone. The GPU-available
+/// figure is clamped to the shared pool: Metal passes `iogpu.wired_limit_mb`
+/// through verbatim, so a sysctl set above physical RAM would otherwise be
+/// reported as-is.
 pub(crate) fn format_unified_memory_line(
     name: &str,
     shared_gb: f64,
@@ -2170,9 +2173,12 @@ pub(crate) fn format_unified_memory_line(
     backend_label: &str,
 ) -> String {
     match gpu_available_gb {
-        Some(available) => format!(
-            "{name} (unified memory, {available:.2} GB GPU-available of {shared_gb:.2} GB shared, {backend_label})"
-        ),
+        Some(available) => {
+            let available = available.min(shared_gb);
+            format!(
+                "{name} (unified memory, {available:.2} GB GPU-available of {shared_gb:.2} GB shared, {backend_label})"
+            )
+        }
         None => format!("{name} (unified memory, {shared_gb:.2} GB shared, {backend_label})"),
     }
 }
@@ -3608,6 +3614,17 @@ GPU id = 1 (NVIDIA GeForce RTX 4090)
         assert_eq!(
             line,
             "Apple M3 (unified memory, 11.84 GB GPU-available of 16.00 GB shared, Metal)"
+        );
+    }
+
+    #[test]
+    fn test_unified_line_clamps_gpu_available_to_shared_pool() {
+        // An iogpu.wired_limit_mb set above physical RAM passes through Metal
+        // verbatim; the display must bound it by the shared pool.
+        let line = super::format_unified_memory_line("Apple M3", 16.0, Some(976.56), "Metal");
+        assert_eq!(
+            line,
+            "Apple M3 (unified memory, 16.00 GB GPU-available of 16.00 GB shared, Metal)"
         );
     }
 
