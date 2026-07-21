@@ -752,8 +752,27 @@ fn handle_benchmarks_mode(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // `/` search box captures keystrokes while active
+    if app.bench_search_active {
+        match key.code {
+            KeyCode::Esc => app.bench_search_clear(),
+            KeyCode::Enter => app.bench_search_accept(),
+            KeyCode::Backspace => app.bench_search_backspace(),
+            KeyCode::Up => app.bench_move_up(),
+            KeyCode::Down => app.bench_move_down(),
+            KeyCode::Char(c) if allows_search_text_input(key.modifiers) => {
+                app.bench_search_input(c)
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
+        // With a filter applied, Esc clears it first; q/b still close directly.
+        KeyCode::Esc if !app.bench_search_query.is_empty() => app.bench_search_clear(),
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') => app.close_benchmarks(),
+        KeyCode::Char('/') => app.bench_search_start(),
         KeyCode::Up | KeyCode::Char('k') => app.bench_move_up(),
         KeyCode::Down | KeyCode::Char('j') => app.bench_move_down(),
         KeyCode::Char('r') => app.bench_refresh(),
